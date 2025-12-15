@@ -8,8 +8,10 @@ from google.auth import default
 import gspread
 from gspread_dataframe import set_with_dataframe
 import pandas as pd
-import time
 from urllib.parse import urlparse, urljoin
+import cloudscraper
+import time
+import random
 
 # --------------------------------------------------------------
 # 1️⃣ CONSTANTS & CONFIGURATION
@@ -18,14 +20,18 @@ try:
     CANVAS_API_URL = userdata.get('CANVAS_API_URL')
     CANVAS_API_KEY = userdata.get('CANVAS_API_KEY')
 except Exception:
-    # Fallback if secrets aren't set (for local testing, though Colab secrets are preferred)
+    # Fallback for manual entry if secrets aren't set
     CANVAS_API_URL = "https://your_canvas_domain.instructure.com"
     CANVAS_API_KEY = "your_api_key"
 
-# User-Agent to prevent 403s from strict servers (like Wikipedia/Amazon)
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-}
+# Cloudscraper automatically handles User-Agents and Cloudflare challenges
+scraper = cloudscraper.create_scraper(
+    browser={
+        'browser': 'chrome',
+        'platform': 'windows',
+        'desktop': True
+    }
+)
 
 # ----------------------------------------------------------------------
 # CanvasAPI Setup
@@ -36,15 +42,22 @@ except ImportError as exc:
     raise ImportError("Please install canvasapi via `!pip install canvasapi`") from exc
 
 # ----------------------------------------------------------------------
-# Helper Functions: Link Extraction & Checking
+# Helper Functions
 # ----------------------------------------------------------------------
 
 def _get_domain(url):
-    """Extracts domain from URL for internal link checking."""
+    """Extracts domain from URL."""
     try:
         return urlparse(url).netloc
     except:
         return ""
+
+def _extract_course_id(url):
+    """Attempts to extract a course ID from a Canvas URL."""
+    match = re.search(r'/courses/(\d+)', url)
+    if match:
+        return match.group(1)
+    return None
 
 def _is_valid_url(url):
     """Filters out mailto, javascript, and empty links."""
@@ -52,39 +65,41 @@ def _is_valid_url(url):
 
 def _check_link_status(args):
     """
-    Checks the HTTP status of a single URL.
-    Returns: (url, status_code, reason, is_redirect, final_url)
+    Checks the HTTP status of a single URL using Cloudscraper.
+    Returns: (url, status_code, reason, is_redirect, final_url, is_canvas_link)
     """
     url, api_key = args
     
-    # Prepare headers
-    req_headers = HEADERS.copy()
+    # Random sleep to behave more like a human (prevent rate limiting)
+    time.sleep(random.uniform(0.5, 1.5))
+
+    is_canvas_link = _get_domain(CANVAS_API_URL) in url
     
-    # If it's an internal Canvas link, add the Authorization header
-    if _get_domain(CANVAS_API_URL) in url:
-        req_headers["Authorization"] = f"Bearer {api_key}"
+    # Prepare headers specifically for internal Canvas links
+    # For external links, we let Cloudscraper handle headers
+    headers = {}
+    if is_canvas_link:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     try:
-        # We use stream=True to avoid downloading large files just to check headers
-        # We allow redirects to track them, but we check history to see if it happened
-        r = requests.get(url, headers=req_headers, timeout=10, stream=True, verify=False) # verify=False helps with some weird SSL certs, use with caution
+        # Use scraper.get instead of requests.get
+        # allow_redirects=True is default, but we check history manually if needed
+        r = scraper.get(url, headers=headers, timeout=20, allow_redirects=True)
         
         status_code = r.status_code
         reason = r.reason
         is_redirect = len(r.history) > 0
         final_url = r.url
         
-        # Close connection explicitly
-        r.close()
-        
-        return url, status_code, reason, is_redirect, final_url
+        return url, status_code, reason, is_redirect, final_url, is_canvas_link
 
     except requests.exceptions.ConnectionError:
-        return url, 0, "Connection Error", False, ""
+        return url, 0, "Connection Error", False, "", is_canvas_link
     except requests.exceptions.Timeout:
-        return url, 0, "Timeout", False, ""
-    except requests.exceptions.RequestException as e:
-        return url, 0, f"Error: {str(e)}", False, ""
+        return url, 0, "Timeout", False, "", is_canvas_link
+    except Exception as e:
+        # Cloudscraper can sometimes raise specific Cloudflare errors
+        return url, 0, f"Error: {str(e)}", False, "", is_canvas_link
 
 def _extract_links_from_html(html, source_url, location_name):
     """Parses HTML and extracts a list of link dictionaries."""
@@ -94,12 +109,10 @@ def _extract_links_from_html(html, source_url, location_name):
     soup = BeautifulSoup(html, "html.parser")
     found_links = []
 
-    # 1. Check Anchor tags (href)
     for a in soup.find_all("a"):
         href = a.get("href")
-        text = a.get_text(strip=True)[:50] # First 50 chars of link text
+        text = a.get_text(strip=True)[:50]
         if _is_valid_url(href):
-            # Resolve relative URLs
             full_url = urljoin(CANVAS_API_URL, href)
             found_links.append({
                 "url": full_url,
@@ -109,7 +122,6 @@ def _extract_links_from_html(html, source_url, location_name):
                 "type": "Link"
             })
 
-    # 2. Check Images (src)
     for img in soup.find_all("img"):
         src = img.get("src")
         if _is_valid_url(src):
@@ -122,7 +134,6 @@ def _extract_links_from_html(html, source_url, location_name):
                 "type": "Image"
             })
             
-    # 3. Check Iframes (src)
     for iframe in soup.find_all("iframe"):
         src = iframe.get("src")
         if _is_valid_url(src):
@@ -142,18 +153,21 @@ def _extract_links_from_html(html, source_url, location_name):
 # ----------------------------------------------------------------------
 def run_link_checker(course_input: str):
     """
-    Scans a Canvas course for broken/redirected links and saves to Google Sheets.
+    Scans a Canvas course for broken (4xx/5xx) or redirected links using Cloudscraper.
     """
     
     # 1. Authentication
     print("🔐 Authenticating with Google Sheets …")
-    auth.authenticate_user()
-    creds, _ = default()
-    gc = gspread.authorize(creds)
+    try:
+        auth.authenticate_user()
+        creds, _ = default()
+        gc = gspread.authorize(creds)
+    except Exception as e:
+        print(f"⚠️ Google Auth failed (Running locally?): {e}")
+        gc = None
     
     canvas = Canvas(CANVAS_API_URL, CANVAS_API_KEY)
     
-    # Resolve Course ID
     if "courses/" in course_input:
         course_id = course_input.split("courses/")[-1].split("/")[0].split("?")[0]
     else:
@@ -169,28 +183,21 @@ def run_link_checker(course_input: str):
     # 2. Scanning Content
     all_links = []
     
-    # --- Pages ---
     print("🔎 Scanning Pages …")
     for p in course.get_pages():
-        # Fetch full body (list endpoint doesn't return body)
         full_page = course.get_page(p.url)
         all_links.extend(_extract_links_from_html(full_page.body, p.html_url, f"Page: {p.title}"))
 
-    # --- Assignments ---
     print("🔎 Scanning Assignments …")
     for a in course.get_assignments():
         all_links.extend(_extract_links_from_html(a.description, a.html_url, f"Assignment: {a.name}"))
 
-    # --- Discussions ---
     print("🔎 Scanning Discussions …")
     for d in course.get_discussion_topics():
         all_links.extend(_extract_links_from_html(d.message, d.html_url, f"Discussion: {d.title}"))
 
-    # --- Syllabus ---
     print("🔎 Scanning Syllabus …")
     try:
-        settings = course.get_settings() # Sometimes syllabus is here
-        # Easier method: reload course with include parameter
         course_with_syll = canvas.get_course(course_id, include="syllabus_body")
         syllabus_body = getattr(course_with_syll, "syllabus_body", "")
         if syllabus_body:
@@ -198,12 +205,10 @@ def run_link_checker(course_input: str):
     except Exception:
         print("⚠️ Could not check Syllabus.")
 
-    # --- Announcements ---
     print("🔎 Scanning Announcements …")
     for ann in course.get_discussion_topics(only_announcements=True):
         all_links.extend(_extract_links_from_html(ann.message, ann.html_url, f"Announcement: {ann.title}"))
 
-    # --- Modules (External URLs) ---
     print("🔎 Scanning Modules (External URL Items) …")
     for mod in course.get_modules():
         for item in mod.get_module_items():
@@ -216,31 +221,25 @@ def run_link_checker(course_input: str):
                     "type": "Module Item"
                 })
 
-    # 3. Deduplicate URLs for efficiency
-    # We want to check each unique URL once, then map results back
+    # 3. Deduplicate URLs
     unique_urls = list(set([item['url'] for item in all_links]))
     print(f"\n🔗 Found {len(all_links)} total links. Checking {len(unique_urls)} unique URLs ...")
 
-    # 4. Check Links (Parallel)
-    # Using a dictionary to store results: {url: (status, reason, is_redirect, final_url)}
+    # 4. Check Links (Reduced Threads for Stealth)
     url_results = {}
     
-    # Suppress SSL warnings for cleaner output
-    requests.packages.urllib3.disable_warnings()
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-        # Create tasks tuple (url, api_key)
+    # Reduced max_workers to 5 to avoid triggering aggressive firewalls
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         tasks = [(url, CANVAS_API_KEY) for url in unique_urls]
-        
-        # Map tasks
         results = list(executor.map(_check_link_status, tasks))
         
-        for url, status, reason, is_redirect, final_url in results:
+        for url, status, reason, is_redirect, final_url, is_canvas_link in results:
             url_results[url] = {
                 "status": status,
                 "reason": reason,
                 "redirect": is_redirect,
-                "final_url": final_url
+                "final_url": final_url,
+                "is_canvas": is_canvas_link
             }
 
     # 5. Compile Report Data
@@ -253,40 +252,60 @@ def run_link_checker(course_input: str):
             
         status_code = res['status']
         is_redirect = res['redirect']
+        is_canvas = res['is_canvas']
         
-        # FILTER: Only report Broken (400+), Redirects (300+ or history), or Errors (0)
-        # We generally treat 200 as success and exclude it, unless it was a redirect
-        is_broken = status_code >= 400 or status_code == 0
+        issue_type = None
         
-        if is_broken or is_redirect:
+        # Issue Classification Logic
+        if status_code >= 500:
+            issue_type = "Server Error (5xx)"
+        elif is_canvas and status_code in [401, 403]:
+            link_course_id = _extract_course_id(link['url'])
+            if link_course_id and str(link_course_id) != str(course_id):
+                issue_type = "Inaccessible Canvas Course (Other Course)"
+            else:
+                issue_type = "Access Denied (Locked Content)"
+        elif status_code >= 400:
+            issue_type = "Broken Link (4xx)"
+        elif status_code == 0:
+            issue_type = "Connection Failed"
+        elif is_redirect:
+            issue_type = "Redirect"
+        
+        if issue_type:
             row = {
+                "Issue Type": issue_type,
                 "Location": link['location_name'],
-                "Link Text/Alt": link['text'],
-                "Original URL": link['url'],
                 "Status Code": status_code,
-                "Status": res['reason'],
-                "Issue Type": "Broken Link" if is_broken else "Redirect",
-                "Final URL (if redirect)": res['final_url'] if is_redirect else "",
-                "Canvas Link": link['source_url']
+                "Status Msg": res['reason'],
+                "Link Text": link['text'],
+                "Original URL": link['url'],
+                "Final URL": res['final_url'] if is_redirect else "",
+                "Canvas Edit Link": link['source_url']
             }
             report_rows.append(row)
 
     df = pd.DataFrame(report_rows)
 
-    # 6. Export to Google Sheets
+    # 6. Export Report
     print(f"\n📊 Processing {len(report_rows)} issues found …")
     
     if df.empty:
-        print("✅ No broken or redirected links found!")
+        print("✅ No broken, redirected, or inaccessible links found!")
         return
 
-    # Sort: Broken links first, then redirects
     df.sort_values(by=["Issue Type", "Location"], inplace=True)
+    
+    # Handle CSV Fallback if Google Sheets is not available (e.g. local run)
+    if gc is None:
+        csv_name = f"Link_Report_{course_id}.csv"
+        df.to_csv(csv_name, index=False)
+        print(f"💾 Google Auth unavailable. Saved as CSV: {csv_name}")
+        return
 
     sheet_title = f"{course.name} Link Report"
     
     try:
-        # Check if sheet exists
         existing_sheets = gc.list_spreadsheet_files()
         sheet = next((s for s in existing_sheets if s["name"] == sheet_title), None)
         
@@ -301,8 +320,6 @@ def run_link_checker(course_input: str):
             ws = sh.sheet1
             
         set_with_dataframe(ws, df)
-        
-        # Apply basic formatting (frozen header)
         ws.format('A1:H1', {'textFormat': {'bold': True}})
         ws.freeze(rows=1)
 
@@ -311,11 +328,12 @@ def run_link_checker(course_input: str):
         
     except Exception as e:
         print(f"❌ Error writing to Google Sheet: {e}")
-        # Fallback to CSV if Sheets fails
-        csv_name = "link_report.csv"
-        df.to_csv(csv_name, index=False)
-        print(f"💾 Saved as CSV instead: {csv_name}")
+        df.to_csv("link_report.csv", index=False)
+        print(f"💾 Saved as CSV instead.")
 
-# Execute
-# Replace with your course ID or URL below when calling the function
-# run_link_checker("123456")
+if __name__ == "__main__":
+    # Allow running directly from command line if desired
+    # Example: python canvas_link_checker.py
+    import sys
+    if len(sys.argv) > 1:
+        run_link_checker(sys.argv[1])
