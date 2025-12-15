@@ -5,3 +5,4 @@ gspread-dataframe
 beautifulsoup4
 requests
 google-auth
+cloudscraper
