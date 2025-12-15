@@ -20,11 +20,11 @@ try:
     CANVAS_API_URL = userdata.get('CANVAS_API_URL')
     CANVAS_API_KEY = userdata.get('CANVAS_API_KEY')
 except Exception:
-    # Fallback for manual entry if secrets aren't set
+    # Fallback for manual entry
     CANVAS_API_URL = "https://your_canvas_domain.instructure.com"
     CANVAS_API_KEY = "your_api_key"
 
-# Cloudscraper automatically handles User-Agents and Cloudflare challenges
+# Cloudscraper configuration to mimic a real desktop browser
 scraper = cloudscraper.create_scraper(
     browser={
         'browser': 'chrome',
@@ -65,26 +65,22 @@ def _is_valid_url(url):
 
 def _check_link_status(args):
     """
-    Checks the HTTP status of a single URL using Cloudscraper.
-    Returns: (url, status_code, reason, is_redirect, final_url, is_canvas_link)
+    Checks the HTTP status of a single URL using Cloudscraper with delays.
     """
     url, api_key = args
     
-    # Random sleep to behave more like a human (prevent rate limiting)
-    time.sleep(random.uniform(0.5, 1.5))
+    # SLOW DOWN: Random sleep between 2 to 5 seconds to mimic human behavior
+    time.sleep(random.uniform(2, 5))
 
     is_canvas_link = _get_domain(CANVAS_API_URL) in url
     
-    # Prepare headers specifically for internal Canvas links
-    # For external links, we let Cloudscraper handle headers
     headers = {}
     if is_canvas_link:
         headers["Authorization"] = f"Bearer {api_key}"
 
     try:
-        # Use scraper.get instead of requests.get
-        # allow_redirects=True is default, but we check history manually if needed
-        r = scraper.get(url, headers=headers, timeout=20, allow_redirects=True)
+        # Check link
+        r = scraper.get(url, headers=headers, timeout=30, allow_redirects=True)
         
         status_code = r.status_code
         reason = r.reason
@@ -98,7 +94,6 @@ def _check_link_status(args):
     except requests.exceptions.Timeout:
         return url, 0, "Timeout", False, "", is_canvas_link
     except Exception as e:
-        # Cloudscraper can sometimes raise specific Cloudflare errors
         return url, 0, f"Error: {str(e)}", False, "", is_canvas_link
 
 def _extract_links_from_html(html, source_url, location_name):
@@ -109,6 +104,7 @@ def _extract_links_from_html(html, source_url, location_name):
     soup = BeautifulSoup(html, "html.parser")
     found_links = []
 
+    # Check Anchors
     for a in soup.find_all("a"):
         href = a.get("href")
         text = a.get_text(strip=True)[:50]
@@ -122,6 +118,7 @@ def _extract_links_from_html(html, source_url, location_name):
                 "type": "Link"
             })
 
+    # Check Images
     for img in soup.find_all("img"):
         src = img.get("src")
         if _is_valid_url(src):
@@ -134,6 +131,7 @@ def _extract_links_from_html(html, source_url, location_name):
                 "type": "Image"
             })
             
+    # Check Iframes
     for iframe in soup.find_all("iframe"):
         src = iframe.get("src")
         if _is_valid_url(src):
@@ -153,7 +151,7 @@ def _extract_links_from_html(html, source_url, location_name):
 # ----------------------------------------------------------------------
 def run_link_checker(course_input: str):
     """
-    Scans a Canvas course for broken (4xx/5xx) or redirected links using Cloudscraper.
+    Scans a Canvas course for broken (4xx/5xx) or redirected links.
     """
     
     # 1. Authentication
@@ -183,19 +181,23 @@ def run_link_checker(course_input: str):
     # 2. Scanning Content
     all_links = []
     
+    # Pages
     print("🔎 Scanning Pages …")
     for p in course.get_pages():
         full_page = course.get_page(p.url)
         all_links.extend(_extract_links_from_html(full_page.body, p.html_url, f"Page: {p.title}"))
 
+    # Assignments
     print("🔎 Scanning Assignments …")
     for a in course.get_assignments():
         all_links.extend(_extract_links_from_html(a.description, a.html_url, f"Assignment: {a.name}"))
 
+    # Discussions
     print("🔎 Scanning Discussions …")
     for d in course.get_discussion_topics():
         all_links.extend(_extract_links_from_html(d.message, d.html_url, f"Discussion: {d.title}"))
 
+    # Syllabus
     print("🔎 Scanning Syllabus …")
     try:
         course_with_syll = canvas.get_course(course_id, include="syllabus_body")
@@ -205,10 +207,12 @@ def run_link_checker(course_input: str):
     except Exception:
         print("⚠️ Could not check Syllabus.")
 
+    # Announcements
     print("🔎 Scanning Announcements …")
     for ann in course.get_discussion_topics(only_announcements=True):
         all_links.extend(_extract_links_from_html(ann.message, ann.html_url, f"Announcement: {ann.title}"))
 
+    # Modules
     print("🔎 Scanning Modules (External URL Items) …")
     for mod in course.get_modules():
         for item in mod.get_module_items():
@@ -224,12 +228,13 @@ def run_link_checker(course_input: str):
     # 3. Deduplicate URLs
     unique_urls = list(set([item['url'] for item in all_links]))
     print(f"\n🔗 Found {len(all_links)} total links. Checking {len(unique_urls)} unique URLs ...")
+    print("⏳ This will take longer due to rate limiting (Stealth Mode) ...")
 
-    # 4. Check Links (Reduced Threads for Stealth)
+    # 4. Check Links (VERY SLOW MODE)
     url_results = {}
     
-    # Reduced max_workers to 5 to avoid triggering aggressive firewalls
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    # Reduced max_workers to 2
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         tasks = [(url, CANVAS_API_KEY) for url in unique_urls]
         results = list(executor.map(_check_link_status, tasks))
         
@@ -256,7 +261,6 @@ def run_link_checker(course_input: str):
         
         issue_type = None
         
-        # Issue Classification Logic
         if status_code >= 500:
             issue_type = "Server Error (5xx)"
         elif is_canvas and status_code in [401, 403]:
@@ -296,7 +300,6 @@ def run_link_checker(course_input: str):
 
     df.sort_values(by=["Issue Type", "Location"], inplace=True)
     
-    # Handle CSV Fallback if Google Sheets is not available (e.g. local run)
     if gc is None:
         csv_name = f"Link_Report_{course_id}.csv"
         df.to_csv(csv_name, index=False)
@@ -332,8 +335,6 @@ def run_link_checker(course_input: str):
         print(f"💾 Saved as CSV instead.")
 
 if __name__ == "__main__":
-    # Allow running directly from command line if desired
-    # Example: python canvas_link_checker.py
     import sys
     if len(sys.argv) > 1:
         run_link_checker(sys.argv[1])
